@@ -12,9 +12,8 @@ CYAN = (255, 220, 0)
 GREEN = (60, 200, 60)
 ORANGE = (0, 140, 255)
 MAGENTA = (255, 0, 255)
-BLUE = (255, 120, 40)
-PURPLE = (200, 80, 200)
-YELLOW = (0, 200, 255)
+EXISTING = (180, 180, 255)  # light warm for dashed existing
+PROPOSED = (255, 200, 0)  # cyan-ish proposed
 
 
 def compose_overlay(
@@ -35,24 +34,33 @@ def compose_overlay(
         **(layers or {}),
     }
     out = image_bgr.copy()
-    out = cv2.addWeighted(out, 0.65, np.full_like(out, 30), 0.35, 0)
+    out = cv2.addWeighted(out, 0.7, np.full_like(out, 30), 0.3, 0)
 
     if layers.get("segments", True) and segments is not None:
-        for bbox, color in (
-            (segments.drawing_bbox, BLUE),
-            (segments.legend_bbox, PURPLE),
-            (segments.title_block_bbox, YELLOW),
-        ):
-            if bbox is None:
-                continue
-            x0, y0, x1, y1 = bbox
-            cv2.rectangle(out, (x0, y0), (x1, y1), color, 2)
+        for region in segments.regions:
+            x0, y0, x1, y1 = region.bbox
+            color = _hex_to_bgr(region.color)
+            thickness = 3 if region.role == "drawing" else 2
+            cv2.rectangle(out, (x0, y0), (x1, y1), color, thickness)
+            cv2.putText(
+                out,
+                region.name,
+                (x0 + 6, max(18, y0 + 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
 
     if layers.get("contours", True):
         for poly in polylines:
+            if poly.kind == "structure":
+                continue
+            color = EXISTING if poly.kind == "existing" else PROPOSED
             pts = poly.points.astype(np.int32).reshape(-1, 1, 2)
             cv2.polylines(
-                out, [pts], isClosed=False, color=CYAN, thickness=2, lineType=cv2.LINE_AA
+                out, [pts], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA
             )
 
     if layers.get("associations", True):
@@ -65,13 +73,12 @@ def compose_overlay(
         for e in elevations:
             x0, y0, x1, y1 = map(int, e.bbox)
             cv2.rectangle(out, (x0 - 2, y0 - 2), (x1 + 2, y1 + 2), GREEN, 2)
-            label = f"{e.value_ft:.2f}"
             cv2.putText(
                 out,
-                label,
+                f"{e.value_ft:.2f}",
                 (x0, max(14, y0 - 4)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                0.4,
                 GREEN,
                 1,
                 cv2.LINE_AA,
@@ -82,3 +89,9 @@ def compose_overlay(
             cv2.circle(out, (int(e.x), int(e.y)), 7, ORANGE, 2, cv2.LINE_AA)
 
     return out
+
+
+def _hex_to_bgr(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b, g, r)

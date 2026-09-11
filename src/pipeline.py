@@ -31,6 +31,7 @@ class PipelineResult:
     volumes: CutFillResult
     evaluation: EvaluationResult | None
     overlay_bgr: np.ndarray
+    sheet_label: str = ""
     stage_status: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -42,15 +43,17 @@ def run_pipeline(
     dpi: int = 150,
     scale_ft_per_inch: float | None = None,
     ground_truth: dict | None = None,
-    use_ocr: bool = True,
+    use_ocr: bool = False,
     overlay_layers: dict[str, bool] | None = None,
+    sheet_label: str = "",
+    compute_volumes: bool = True,
 ) -> PipelineResult:
     warnings: list[str] = []
     status = {
         "contours": "pending",
         "elevations": "pending",
         "symbols": "heuristic",
-        "existing_vs_proposed": "heuristic",
+        "existing_vs_proposed": "pending",
         "legend": "pending",
         "scale": "pending",
         "segments": "pending",
@@ -73,10 +76,7 @@ def run_pipeline(
 
     legend = extract_legend(page, segments)
     status["legend"] = "done" if legend else "empty"
-    if not legend:
-        warnings.append("No legend entries parsed from the sheet.")
 
-    # Run contour extraction on drawing crop for clarity, then offset coords
     x0, y0, x1, y1 = segments.drawing_bbox
     drawing = page.image_bgr[y0:y1, x0:x1]
     local_polys = extract_curved_contours(drawing)
@@ -86,23 +86,40 @@ def run_pipeline(
         pts[:, 0] += x0
         pts[:, 1] += y0
         polylines.append(
-            Polyline(points=pts, length_px=poly.length_px, source=poly.source)
+            Polyline(
+                points=pts,
+                length_px=poly.length_px,
+                source=poly.source,
+                kind=poly.kind,
+                straightness=poly.straightness,
+                mean_abs_turn=poly.mean_abs_turn,
+            )
         )
     status["contours"] = "done" if polylines else "empty"
-    if not polylines:
-        warnings.append("No curved contour polylines detected in drawing viewport.")
+    n_exist = sum(1 for p in polylines if p.kind == "existing")
+    n_prop = sum(1 for p in polylines if p.kind == "proposed")
+    status["existing_vs_proposed"] = f"existing={n_exist}, proposed={n_prop}"
 
-    elevations = extract_elevations(page, use_ocr=use_ocr)
-    # Prefer elevations inside the drawing viewport for association/volumes
+    elevations = extract_elevations(
+        page,
+        use_ocr=use_ocr,
+        drawing_bbox=segments.drawing_bbox,
+    )
     drawing_elevations = [
         e for e in elevations if point_in_bbox(e.x, e.y, segments.drawing_bbox)
-    ] or elevations
+    ]
     status["elevations"] = "done" if drawing_elevations else "empty"
     if not drawing_elevations:
-        warnings.append("No elevation callouts detected in drawing viewport.")
+        warnings.append("No high-quality elevation callouts in drawing viewport.")
 
     associations = associate_elevations(drawing_elevations, polylines)
     status["association"] = "done" if associations else "empty"
+    if drawing_elevations and associations:
+        rate = len(associations) / max(len(drawing_elevations), 1)
+        if rate < 0.35:
+            warnings.append(
+                f"Low elevation↔contour association rate ({rate:.0%})."
+            )
 
     surfaces = build_surfaces(
         page=page,
@@ -111,17 +128,28 @@ def run_pipeline(
         polylines=polylines,
         scale_ft_per_inch=effective_scale,
     )
-    if surfaces.point_count < 3:
+    if surfaces.existing_count < 3:
         warnings.append(
-            "Fewer than 3 elevation-linked points; volume estimate is unreliable."
+            "Few/no existing-surface samples (ME/dashed); using proposed−0.25ft fallback."
         )
 
-    volumes = compute_cut_fill(surfaces)
-    status["cut_fill"] = "done" if volumes.ok else "failed"
-    if not volumes.ok:
-        warnings.append(volumes.message)
-
-    evaluation = evaluate(volumes, ground_truth) if ground_truth else None
+    if compute_volumes:
+        volumes = compute_cut_fill(surfaces)
+        status["cut_fill"] = "done" if volumes.ok else "failed"
+        if not volumes.ok:
+            warnings.append(volumes.message)
+        evaluation = evaluate(volumes, ground_truth) if ground_truth else None
+    else:
+        volumes = CutFillResult(
+            cut_cy=0.0,
+            fill_cy=0.0,
+            net_cy=0.0,
+            ok=False,
+            message="Volumes not computed for this sheet (context only).",
+            cell_count=0,
+        )
+        status["cut_fill"] = "skipped"
+        evaluation = None
 
     overlay_bgr = compose_overlay(
         page.image_bgr,
@@ -144,6 +172,7 @@ def run_pipeline(
         volumes=volumes,
         evaluation=evaluation,
         overlay_bgr=overlay_bgr,
+        sheet_label=sheet_label,
         stage_status=status,
         warnings=warnings,
     )

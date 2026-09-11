@@ -25,11 +25,6 @@ def build_interactive_figure(
     focus_drawing: bool = True,
     max_display_width: int = 1600,
 ) -> go.Figure:
-    """Zoomable Plotly viewer with toggleable detection layers.
-
-    Uses a compressed JPEG layout image (not go.Image pixel arrays) so layer
-    toggles do not re-send tens of MB and crash the browser/websocket.
-    """
     layers = {
         "contours": True,
         "elevations": True,
@@ -51,7 +46,6 @@ def build_interactive_figure(
         return float(y) * scale
 
     fig = go.Figure()
-    # Invisible anchor trace so axes exist even with no overlays
     fig.add_trace(
         go.Scatter(
             x=[0, w],
@@ -65,29 +59,35 @@ def build_interactive_figure(
     )
 
     if layers.get("contours", True) and polylines:
-        xs: list[float | None] = []
-        ys: list[float | None] = []
-        for poly in polylines:
-            for x, y in poly.points:
-                xs.append(sx(x))
-                ys.append(sy(y))
-            xs.append(None)
-            ys.append(None)
-        if len(xs) > 1:
-            fig.add_trace(
-                go.Scattergl(
-                    x=xs,
-                    y=ys,
-                    mode="lines",
-                    line=dict(color="#00E5FF", width=2),
-                    name="Curved contours",
-                    hoverinfo="skip",
+        for kind, color, label in (
+            ("existing", "#C4B5FD", "Existing contours"),
+            ("proposed", "#22D3EE", "Proposed contours"),
+            ("topo", "#67E8F9", "Topo contours"),
+        ):
+            xs: list[float | None] = []
+            ys: list[float | None] = []
+            for poly in polylines:
+                if poly.kind != kind:
+                    continue
+                for x, y in poly.points:
+                    xs.append(sx(x))
+                    ys.append(sy(y))
+                xs.append(None)
+                ys.append(None)
+            if len(xs) > 1:
+                fig.add_trace(
+                    go.Scattergl(
+                        x=xs,
+                        y=ys,
+                        mode="lines",
+                        line=dict(color=color, width=2),
+                        name=label,
+                        hoverinfo="skip",
+                    )
                 )
-            )
 
     if layers.get("associations", True) and associations:
-        xs = []
-        ys = []
+        xs, ys = [], []
         for a in associations:
             xs.extend([sx(a.elevation.x), sx(a.point_xy[0]), None])
             ys.extend([sy(a.elevation.y), sy(a.point_xy[1]), None])
@@ -113,8 +113,8 @@ def build_interactive_figure(
                 textposition="top center",
                 textfont=dict(size=9, color="#14532D"),
                 name="Elevations",
-                customdata=[e.text for e in elevations],
-                hovertemplate="%{text} ft<br>%{customdata}<extra></extra>",
+                customdata=[[e.text, e.kind] for e in elevations],
+                hovertemplate="%{text} ft (%{customdata[1]})<br>%{customdata[0]}<extra></extra>",
             )
         )
 
@@ -136,14 +136,8 @@ def build_interactive_figure(
 
     shapes = []
     if layers.get("segments", True) and segments is not None:
-        for bbox, color in (
-            (segments.drawing_bbox, "#3B82F6"),
-            (segments.legend_bbox, "#A855F7"),
-            (segments.title_block_bbox, "#EAB308"),
-        ):
-            if bbox is None:
-                continue
-            x0, y0, x1, y1 = bbox
+        for region in segments.regions:
+            x0, y0, x1, y1 = region.bbox
             shapes.append(
                 dict(
                     type="rect",
@@ -151,7 +145,7 @@ def build_interactive_figure(
                     y0=sy(y0),
                     x1=sx(x1),
                     y1=sy(y1),
-                    line=dict(color=color, width=2, dash="dot"),
+                    line=dict(color=region.color, width=2, dash="dot"),
                     fillcolor="rgba(0,0,0,0)",
                 )
             )

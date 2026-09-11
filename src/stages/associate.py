@@ -20,17 +20,39 @@ def associate_elevations(
     elevations: list[ElevationCallout],
     polylines: list[Polyline],
     *,
-    max_dist_px: float = 40.0,
+    max_dist_px: float = 48.0,
 ) -> list[Association]:
     if not elevations or not polylines:
         return []
+
+    # Prefer topo-class polylines; ignore architectural structure runs
+    usable = [
+        (i, p)
+        for i, p in enumerate(polylines)
+        if p.kind in ("topo", "existing", "proposed")
+    ]
+    if not usable:
+        usable = list(enumerate(polylines))
 
     associations: list[Association] = []
     for elev in elevations:
         best_i = -1
         best_d = float("inf")
         best_pt = (elev.x, elev.y)
-        for i, poly in enumerate(polylines):
+        # Prefer matching existing elevations to existing contours
+        prefer = None
+        if elev.kind == "existing_match":
+            prefer = "existing"
+        elif elev.kind in ("spot", "ffe"):
+            prefer = "proposed"
+
+        candidates = usable
+        if prefer is not None:
+            preferred = [(i, p) for i, p in usable if p.kind == prefer]
+            if preferred:
+                candidates = preferred
+
+        for i, poly in candidates:
             d, pt = _distance_to_polyline(elev.x, elev.y, poly.points)
             if d < best_d:
                 best_d = d

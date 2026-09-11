@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import cv2
@@ -12,6 +13,9 @@ class Polyline:
     points: np.ndarray  # (N, 2) float xy in pixels
     length_px: float
     source: str = "skeleton"
+    kind: str = "topo"  # topo | structure | existing | proposed
+    straightness: float = 0.0
+    mean_abs_turn: float = 0.0
 
 
 def extract_curved_contours(
@@ -21,11 +25,7 @@ def extract_curved_contours(
     max_polylines: int = 400,
     work_max_dim: int = 1600,
 ) -> list[Polyline]:
-    """Extract curved ink strokes as polylines via adaptive threshold + skeleton.
-
-    Runs skeletonization on a downscaled image for speed, then scales polylines
-    back to full resolution.
-    """
+    """Extract ink strokes, then keep topo-like curves (drop walls/stalls)."""
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     scale = 1.0
@@ -60,24 +60,115 @@ def extract_curved_contours(
     skel = skeletonize(thin > 0).astype(np.uint8) * 255
 
     min_len = min_length_px * scale
-    polylines = _trace_skeleton(skel, min_length_px=min_len)
-    # Scale back to full-res coordinates
+    polylines = _trace_skeleton(skel, min_length_px=min_len, gray=gray)
+
     if scale != 1.0:
         inv = 1.0 / scale
         for poly in polylines:
             poly.points = poly.points * inv
             poly.length_px = poly.length_px * inv
 
-    polylines.sort(key=lambda p: p.length_px, reverse=True)
-    return polylines[:max_polylines]
+    # Classify + filter architectural junk
+    kept: list[Polyline] = []
+    for poly in polylines:
+        _annotate_geometry(poly)
+        poly.kind = _classify_polyline(poly, gray_full=None, scale=1.0)
+        if poly.kind == "structure":
+            continue
+        kept.append(poly)
+
+    # Dash vs solid on full-res crop using local gray sampling
+    for poly in kept:
+        poly.kind = _classify_existing_proposed(poly, image_bgr)
+
+    kept.sort(key=lambda p: p.length_px, reverse=True)
+    return kept[:max_polylines]
 
 
-def _trace_skeleton(skel: np.ndarray, *, min_length_px: float) -> list[Polyline]:
+def filter_topo_polylines(polylines: list[Polyline]) -> list[Polyline]:
+    return [p for p in polylines if p.kind in ("topo", "existing", "proposed")]
+
+
+def _annotate_geometry(poly: Polyline) -> None:
+    pts = poly.points
+    if len(pts) < 2:
+        poly.straightness = 1.0
+        poly.mean_abs_turn = 0.0
+        return
+    chord = float(np.linalg.norm(pts[-1] - pts[0]))
+    poly.straightness = chord / max(poly.length_px, 1e-3)
+
+    turns = []
+    for i in range(1, len(pts) - 1):
+        v1 = pts[i] - pts[i - 1]
+        v2 = pts[i + 1] - pts[i]
+        a1 = math.atan2(float(v1[1]), float(v1[0]))
+        a2 = math.atan2(float(v2[1]), float(v2[0]))
+        d = abs((a2 - a1 + math.pi) % (2 * math.pi) - math.pi)
+        turns.append(d)
+    poly.mean_abs_turn = float(np.mean(turns)) if turns else 0.0
+
+
+def _classify_polyline(poly: Polyline, gray_full: np.ndarray | None, scale: float) -> str:
+    """Reject long axis-aligned nearly-straight runs (walls, stalls, grids)."""
+    pts = poly.points
+    if len(pts) < 2:
+        return "structure"
+
+    # Dominant direction
+    v = pts[-1] - pts[0]
+    ang = abs(math.degrees(math.atan2(float(v[1]), float(v[0])))) % 180
+    axis_aligned = min(ang, abs(90 - ang), abs(180 - ang)) < 12
+
+    if poly.straightness > 0.92 and axis_aligned and poly.length_px > 120:
+        return "structure"
+    if poly.straightness > 0.97 and poly.length_px > 200:
+        return "structure"
+    # Short very straight ticks
+    if poly.straightness > 0.98 and poly.mean_abs_turn < 0.05:
+        return "structure"
+    return "topo"
+
+
+def _classify_existing_proposed(poly: Polyline, image_bgr: np.ndarray) -> str:
+    """Heuristic dash detection: sample along polyline for ink gaps → existing."""
+    if poly.kind == "structure":
+        return "structure"
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    pts = poly.points
+    if len(pts) < 4:
+        return "proposed"
+
+    # Sample ~40 points along path
+    idxs = np.linspace(0, len(pts) - 1, num=min(40, len(pts))).astype(int)
+    ink = []
+    for i in idxs:
+        x = int(np.clip(pts[i, 0], 0, w - 1))
+        y = int(np.clip(pts[i, 1], 0, h - 1))
+        # local darkness
+        y0, y1 = max(0, y - 1), min(h, y + 2)
+        x0, x1 = max(0, x - 1), min(w, x + 2)
+        patch = gray[y0:y1, x0:x1]
+        ink.append(float(patch.mean()) < 170)
+
+    if len(ink) < 8:
+        return "proposed"
+    # Transitions between ink/no-ink suggest dashes
+    transitions = sum(1 for a, b in zip(ink, ink[1:]) if a != b)
+    ink_ratio = sum(ink) / len(ink)
+    if transitions >= 6 and 0.25 < ink_ratio < 0.85:
+        return "existing"
+    return "proposed"
+
+
+def _trace_skeleton(
+    skel: np.ndarray, *, min_length_px: float, gray: np.ndarray
+) -> list[Polyline]:
     ys, xs = np.where(skel > 0)
     if len(xs) == 0:
         return []
 
-    # Cap skeleton pixels for pathological dense sheets
     if len(xs) > 120_000:
         step = int(np.ceil(len(xs) / 120_000))
         xs = xs[::step]
