@@ -80,7 +80,7 @@ def build_interactive_figure(
                         x=xs,
                         y=ys,
                         mode="lines",
-                        line=dict(color=color, width=2),
+                        line=dict(color=color, width=2.5),
                         name=label,
                         hoverinfo="skip",
                     )

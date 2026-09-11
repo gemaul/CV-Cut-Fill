@@ -230,8 +230,8 @@ def _render_sheet_tab(
         show_contours = st.checkbox("Contours", value=True, key=f"{sk}_contours")
         show_elevations = st.checkbox("Elevations", value=True, key=f"{sk}_elev")
         show_symbols = st.checkbox("Spot markers", value=True, key=f"{sk}_sym")
-        show_assoc = st.checkbox("Associations", value=True, key=f"{sk}_assoc")
-        show_segments = st.checkbox("Sheet segments", value=True, key=f"{sk}_seg")
+        show_assoc = st.checkbox("Associations", value=False, key=f"{sk}_assoc")
+        show_segments = st.checkbox("Sheet segments", value=False, key=f"{sk}_seg")
         focus_drawing = st.checkbox("Focus drawing", value=True, key=f"{sk}_focus")
         st.divider()
         st.write(

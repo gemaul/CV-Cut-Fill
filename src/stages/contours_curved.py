@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from skimage.filters import sato
 from skimage.morphology import skeletonize
 
 
@@ -21,11 +22,15 @@ class Polyline:
 def extract_curved_contours(
     image_bgr: np.ndarray,
     *,
-    min_length_px: float = 80.0,
-    max_polylines: int = 400,
-    work_max_dim: int = 1600,
+    min_length_px: float = 55.0,
+    max_polylines: int = 500,
+    work_max_dim: int = 1800,
 ) -> list[Polyline]:
-    """Extract ink strokes, then keep topo-like curves (drop walls/stalls)."""
+    """Extract topographic contours via ridge detection (Sato) + skeleton tracing.
+
+    Adaptive threshold alone misses faint mid-gray contour ink. Sato black-ridge
+    filtering targets thin dark strokes, then dash gaps are closed before tracing.
+    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     scale = 1.0
@@ -34,33 +39,28 @@ def extract_curved_contours(
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     wh, ww = gray.shape
 
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    binary = cv2.adaptiveThreshold(
-        blur,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31,
-        8,
+    ink = _ridge_ink_mask(gray)
+
+    # Bridge dashed existing contours
+    ink = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=2,
     )
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
-    cleaned = np.zeros_like(opened)
-    area_limit = (wh * ww) * 0.02
-    min_area = max(20, int(40 * scale * scale))
+    # Drop giant filled components (solid hatches)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    cleaned = np.zeros_like(ink)
+    area_limit = (wh * ww) * 0.04
+    min_area = max(10, int(18 * scale * scale))
     for i in range(1, num):
         area = stats[i, cv2.CC_STAT_AREA]
         if min_area <= area <= area_limit:
             cleaned[labels == i] = 255
 
-    thin = cv2.erode(cleaned, kernel, iterations=1)
-    skel = skeletonize(thin > 0).astype(np.uint8) * 255
-
-    min_len = min_length_px * scale
-    polylines = _trace_skeleton(skel, min_length_px=min_len, gray=gray)
+    skel = skeletonize(cleaned > 0).astype(np.uint8) * 255
+    polylines = _trace_skeleton(skel, min_length_px=min_length_px * scale)
 
     if scale != 1.0:
         inv = 1.0 / scale
@@ -68,25 +68,51 @@ def extract_curved_contours(
             poly.points = poly.points * inv
             poly.length_px = poly.length_px * inv
 
-    # Classify + filter architectural junk
     kept: list[Polyline] = []
     for poly in polylines:
         _annotate_geometry(poly)
-        poly.kind = _classify_polyline(poly, gray_full=None, scale=1.0)
-        if poly.kind == "structure":
+        if _classify_polyline(poly) == "structure":
             continue
+        poly.kind = _classify_existing_proposed(poly, image_bgr)
         kept.append(poly)
 
-    # Dash vs solid on full-res crop using local gray sampling
-    for poly in kept:
-        poly.kind = _classify_existing_proposed(poly, image_bgr)
-
-    kept.sort(key=lambda p: p.length_px, reverse=True)
+    # Prefer longer + curvier strokes (site contours over tiny nicks)
+    kept.sort(
+        key=lambda p: (p.length_px * (1.0 + 2.0 * p.mean_abs_turn)),
+        reverse=True,
+    )
     return kept[:max_polylines]
 
 
 def filter_topo_polylines(polylines: list[Polyline]) -> list[Polyline]:
     return [p for p in polylines if p.kind in ("topo", "existing", "proposed")]
+
+
+def _ridge_ink_mask(gray: np.ndarray) -> np.ndarray:
+    """Sato ridges for faint contours, OR'd with a soft adaptive mask for bold ink."""
+    g = gray.astype(np.float32) / 255.0
+    ridge = sato(g, sigmas=(0.8, 1.2, 1.8, 2.5), black_ridges=True)
+    # Keep strongest ridge responses (thin dark lines)
+    thr = float(np.percentile(ridge, 90))
+    ridge_mask = (ridge >= thr).astype(np.uint8) * 255
+
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    dark = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        8,
+    )
+    # Only keep thin dark strokes from adaptive (erode heavy fills)
+    dark = cv2.morphologyEx(
+        dark,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)),
+        iterations=1,
+    )
+    return cv2.bitwise_or(ridge_mask, dark)
 
 
 def _annotate_geometry(poly: Polyline) -> None:
@@ -97,7 +123,6 @@ def _annotate_geometry(poly: Polyline) -> None:
         return
     chord = float(np.linalg.norm(pts[-1] - pts[0]))
     poly.straightness = chord / max(poly.length_px, 1e-3)
-
     turns = []
     for i in range(1, len(pts) - 1):
         v1 = pts[i] - pts[i - 1]
@@ -109,68 +134,56 @@ def _annotate_geometry(poly: Polyline) -> None:
     poly.mean_abs_turn = float(np.mean(turns)) if turns else 0.0
 
 
-def _classify_polyline(poly: Polyline, gray_full: np.ndarray | None, scale: float) -> str:
-    """Reject long axis-aligned nearly-straight runs (walls, stalls, grids)."""
+def _classify_polyline(poly: Polyline) -> str:
     pts = poly.points
     if len(pts) < 2:
         return "structure"
 
-    # Dominant direction
+    # Strong curvature ⇒ keep as topo even if overall chord is straight-ish
+    if poly.mean_abs_turn >= 0.10:
+        return "topo"
+
     v = pts[-1] - pts[0]
     ang = abs(math.degrees(math.atan2(float(v[1]), float(v[0])))) % 180
-    axis_aligned = min(ang, abs(90 - ang), abs(180 - ang)) < 12
+    axis_aligned = min(ang, abs(90 - ang), abs(180 - ang)) < 10
 
-    if poly.straightness > 0.92 and axis_aligned and poly.length_px > 120:
+    # Parking stalls / walls: long, straight, axis-aligned
+    if poly.straightness > 0.93 and axis_aligned and poly.length_px > 90:
         return "structure"
-    if poly.straightness > 0.97 and poly.length_px > 200:
-        return "structure"
-    # Short very straight ticks
-    if poly.straightness > 0.98 and poly.mean_abs_turn < 0.05:
+    if poly.straightness > 0.985 and poly.length_px > 140:
         return "structure"
     return "topo"
 
 
 def _classify_existing_proposed(poly: Polyline, image_bgr: np.ndarray) -> str:
-    """Heuristic dash detection: sample along polyline for ink gaps → existing."""
-    if poly.kind == "structure":
-        return "structure"
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     pts = poly.points
-    if len(pts) < 4:
+    if len(pts) < 6:
         return "proposed"
 
-    # Sample ~40 points along path
-    idxs = np.linspace(0, len(pts) - 1, num=min(40, len(pts))).astype(int)
+    idxs = np.linspace(0, len(pts) - 1, num=min(50, len(pts))).astype(int)
     ink = []
     for i in idxs:
         x = int(np.clip(pts[i, 0], 0, w - 1))
         y = int(np.clip(pts[i, 1], 0, h - 1))
-        # local darkness
-        y0, y1 = max(0, y - 1), min(h, y + 2)
-        x0, x1 = max(0, x - 1), min(w, x + 2)
-        patch = gray[y0:y1, x0:x1]
-        ink.append(float(patch.mean()) < 170)
+        patch = gray[max(0, y - 1) : min(h, y + 2), max(0, x - 1) : min(w, x + 2)]
+        ink.append(float(patch.mean()) < 185)
 
-    if len(ink) < 8:
-        return "proposed"
-    # Transitions between ink/no-ink suggest dashes
     transitions = sum(1 for a, b in zip(ink, ink[1:]) if a != b)
-    ink_ratio = sum(ink) / len(ink)
-    if transitions >= 6 and 0.25 < ink_ratio < 0.85:
+    ink_ratio = sum(ink) / max(len(ink), 1)
+    if transitions >= 5 and 0.2 < ink_ratio < 0.88:
         return "existing"
     return "proposed"
 
 
-def _trace_skeleton(
-    skel: np.ndarray, *, min_length_px: float, gray: np.ndarray
-) -> list[Polyline]:
+def _trace_skeleton(skel: np.ndarray, *, min_length_px: float) -> list[Polyline]:
     ys, xs = np.where(skel > 0)
     if len(xs) == 0:
         return []
 
-    if len(xs) > 120_000:
-        step = int(np.ceil(len(xs) / 120_000))
+    if len(xs) > 200_000:
+        step = int(np.ceil(len(xs) / 200_000))
         xs = xs[::step]
         ys = ys[::step]
 
@@ -219,7 +232,7 @@ def _trace_skeleton(
         length = float(np.linalg.norm(np.diff(arr, axis=0), axis=1).sum())
         if length < min_length_px:
             continue
-        approx = cv2.approxPolyDP(arr.reshape(-1, 1, 2), epsilon=1.5, closed=False)
+        approx = cv2.approxPolyDP(arr.reshape(-1, 1, 2), epsilon=1.1, closed=False)
         pts = approx.reshape(-1, 2).astype(np.float32)
         if len(pts) < 2:
             continue
