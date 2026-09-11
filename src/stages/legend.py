@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+import cv2
+import numpy as np
 
 from .rasterize import RasterPage
 from .segment import SheetSegments, point_in_bbox
 
-# Common civil legend labels to catch even when layout parsing is messy
 _KNOWN_LABELS = [
     "BUILDING LINE",
     "PROPERTY LINE",
@@ -30,6 +32,7 @@ class LegendEntry:
     symbol_hint: str
     source: str
     bbox: tuple[float, float, float, float] | None = None
+    icon_rgb: np.ndarray | None = field(default=None, repr=False)
 
 
 def extract_legend(page: RasterPage, segments: SheetSegments) -> list[LegendEntry]:
@@ -49,11 +52,9 @@ def extract_legend(page: RasterPage, segments: SheetSegments) -> list[LegendEntr
             )
         ]
     else:
-        # Right rail heuristic
         w = page.width_px
         legend_spans = [s for s in spans if s["bbox_px"][0] > w * 0.68]
 
-    # Start after a MAP LEGEND header when present
     start_y = 0.0
     for s in legend_spans:
         if re.search(r"map\s*legend|legend", s["text"], re.I):
@@ -76,10 +77,8 @@ def extract_legend(page: RasterPage, segments: SheetSegments) -> list[LegendEntr
         if key in seen or len(name) > 80:
             continue
 
-        # Keep likely legend rows: known labels or short title-case / all-caps phrases
         known = any(k in key for k in _KNOWN_LABELS)
         looks_like = bool(re.match(r"^[A-Z0-9][A-Z0-9\s\-/&().%]{2,60}$", name)) or known
-        # Drop title-block noise that often sits near the legend panel
         noise = (
             "DATE",
             "PROJECT",
@@ -100,7 +99,6 @@ def extract_legend(page: RasterPage, segments: SheetSegments) -> list[LegendEntr
         if not looks_like:
             continue
 
-        # Merge broken legend rows like "SPOT" + "ELEVATION"
         if entries and len(name) <= 12 and not known:
             prev = entries[-1].name.upper()
             if len(prev) <= 16 and not any(k in prev for k in _KNOWN_LABELS):
@@ -122,35 +120,103 @@ def extract_legend(page: RasterPage, segments: SheetSegments) -> list[LegendEntr
             )
         )
 
-    # Ensure known labels present in page text are listed even if panel parse missed them
     blob = " ".join(s["text"].upper() for s in spans)
     for label in _KNOWN_LABELS:
         if label not in blob:
             continue
         if any(label in e.name.upper() or e.name.upper() in label for e in entries):
             continue
+        # Try to locate a matching span for cropping
+        bbox = None
+        for s in spans:
+            if label in s["text"].upper():
+                bbox = tuple(s["bbox_px"])  # type: ignore[arg-type]
+                break
         entries.append(
             LegendEntry(
                 name=label.title() if label.isupper() else label,
                 symbol_hint=_symbol_hint(label),
                 source="pdf_keyword",
+                bbox=bbox,
             )
         )
 
-    # De-dupe near-identical names
     deduped: list[LegendEntry] = []
     seen_final: set[str] = set()
     for e in entries:
         key = re.sub(r"\s+", " ", e.name.upper()).strip()
         if key in seen_final:
             continue
-        # Skip if a longer entry already covers this
         if any(key in s or s in key for s in seen_final if abs(len(s) - len(key)) < 12):
             if any(key != s and (key in s) for s in seen_final):
                 continue
         seen_final.add(key)
         deduped.append(e)
-    return deduped
+
+    return attach_legend_icons(page, deduped, segments)
+
+
+def attach_legend_icons(
+    page: RasterPage,
+    entries: list[LegendEntry],
+    segments: SheetSegments,
+) -> list[LegendEntry]:
+    """Crop the graphic to the left of each legend label as a symbol thumbnail."""
+    img = page.image_bgr
+    h, w = img.shape[:2]
+    out: list[LegendEntry] = []
+
+    for e in entries:
+        icon = None
+        if e.bbox is not None:
+            x0, y0, x1, y1 = e.bbox
+            row_h = max(18.0, y1 - y0)
+            # Symbol swatch is typically left of the label text
+            sw = max(48.0, min(140.0, (x1 - x0) * 0.9))
+            ix0 = int(max(0, x0 - sw - 8))
+            ix1 = int(max(ix0 + 8, x0 - 4))
+            iy0 = int(max(0, y0 - row_h * 0.35))
+            iy1 = int(min(h, y1 + row_h * 0.35))
+            # Keep crop inside legend panel when known
+            if segments.legend_bbox is not None:
+                lx0, ly0, lx1, ly1 = segments.legend_bbox
+                ix0 = max(ix0, lx0)
+                ix1 = min(ix1, lx1)
+                iy0 = max(iy0, ly0)
+                iy1 = min(iy1, ly1)
+            if ix1 > ix0 + 4 and iy1 > iy0 + 4:
+                crop = img[iy0:iy1, ix0:ix1]
+                if crop.size:
+                    # Pad to a consistent thumbnail
+                    thumb = _pad_square(crop, 96)
+                    icon = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+
+        out.append(
+            LegendEntry(
+                name=e.name,
+                symbol_hint=e.symbol_hint,
+                source=e.source,
+                bbox=e.bbox,
+                icon_rgb=icon,
+            )
+        )
+    return out
+
+
+def _pad_square(crop_bgr: np.ndarray, size: int) -> np.ndarray:
+    h, w = crop_bgr.shape[:2]
+    scale = size / max(h, w)
+    resized = cv2.resize(
+        crop_bgr,
+        (max(1, int(w * scale)), max(1, int(h * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+    canvas = np.full((size, size, 3), 255, dtype=np.uint8)
+    rh, rw = resized.shape[:2]
+    y0 = (size - rh) // 2
+    x0 = (size - rw) // 2
+    canvas[y0 : y0 + rh, x0 : x0 + rw] = resized
+    return canvas
 
 
 def _symbol_hint(name_upper: str) -> str:

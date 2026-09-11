@@ -140,15 +140,17 @@ def main() -> None:
     with meta_r:
         st.subheader("Map legend symbols")
         if result.legend:
-            st.dataframe(
-                [
-                    {"name": e.name, "symbol": e.symbol_hint, "source": e.source}
-                    for e in result.legend
-                ],
-                use_container_width=True,
-                hide_index=True,
-                height=220,
-            )
+            # Show symbol crop + name for each legend entry
+            for e in result.legend:
+                c_icon, c_text = st.columns([0.22, 0.78], gap="small")
+                with c_icon:
+                    if e.icon_rgb is not None:
+                        st.image(e.icon_rgb, width=72)
+                    else:
+                        st.caption("—")
+                with c_text:
+                    st.markdown(f"**{e.name}**")
+                    st.caption(e.symbol_hint)
         else:
             st.write("No legend entries parsed.")
 
@@ -191,11 +193,20 @@ def main() -> None:
             layers=layers,
             focus_drawing=focus_drawing,
         )
-        st.plotly_chart(fig, use_container_width=True, config={
-            "scrollZoom": True,
-            "displaylogo": False,
-            "modeBarButtonsToAdd": ["drawopenpath", "eraseshape"],
-        })
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            config={
+                "scrollZoom": True,
+                "displaylogo": False,
+                "modeBarButtonsToRemove": [
+                    "lasso2d",
+                    "select2d",
+                    "drawopenpath",
+                    "eraseshape",
+                ],
+            },
+        )
 
     # ---- Volumes / score ----
     vcol, scol = st.columns(2)
