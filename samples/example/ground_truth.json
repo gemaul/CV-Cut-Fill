@@ -1,0 +1,24 @@
+{
+  "job": "Zirl Palmer Preparatory Academy",
+  "basis": "Subgrade vs. Stripped",
+  "unit": "CY",
+  "cut_cy": 952,
+  "fill_cy": 1319,
+  "net_export_import_cy": -367,
+  "source_file": "volume_report.xlsx",
+  "plan_file": "plan.pdf",
+  "plan_sheet": "C-201 Grading Plan",
+  "notes": "Headline totals from Excel Total Regions (earthwork + rock auger refusal).",
+  "regions": {
+    "BUILDING": {"cut_cy": 0, "fill_cy": 713},
+    "CONC PAVE": {"cut_cy": 14, "fill_cy": 0},
+    "HD": {"cut_cy": 555, "fill_cy": 43},
+    "PAD": {"cut_cy": 21, "fill_cy": 4},
+    "SIDEWALK": {"cut_cy": 22, "fill_cy": 151},
+    "TS ISLAND": {"cut_cy": 340, "fill_cy": 408}
+  },
+  "excluded_from_headline": {
+    "stripping_cy": 505,
+    "sectional_cy": 1028
+  }
+}

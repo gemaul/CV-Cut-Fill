@@ -1,0 +1,9 @@
+streamlit>=1.32.0
+pymupdf>=1.24.0
+numpy>=1.26.0
+opencv-python-headless>=4.9.0
+scipy>=1.12.0
+scikit-image>=0.22.0
+Pillow>=10.0.0
+easyocr>=1.7.1
+python-dotenv>=1.0.0
