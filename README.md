@@ -17,6 +17,14 @@ Optional sheets for Try Your Own are under `samples/optional/`.
 1. **Example (with ground truth)** — runs C-201, shows detection overlays, volumes, and error vs 952 / 1319 CY.
 2. **Try Your Own** — upload any PDF; same detection + volumes; **no scoring**.
 
+## UI
+
+- **Interactive Plotly map** — scroll to zoom, drag to pan
+- **Live layer toggles** beside the map (no re-run)
+- **Auto-detected scale** shown as a processed output (`1" = N'`)
+- **Map legend symbols** parsed and listed with symbol hints
+- **Sheet segments** — drawing viewport / legend / title rails outlined
+
 ## Architecture (MVP)
 
 | Problem | Approach in this MVP |

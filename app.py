@@ -6,38 +6,32 @@ import json
 import sys
 from pathlib import Path
 
-import cv2
-import numpy as np
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from src.overlay import compose_overlay
 from src.pipeline import run_pipeline
 from src.stages.evaluate import evaluate
+from src.viewer import build_interactive_figure
 
 EXAMPLE_DIR = ROOT / "samples" / "example"
 EXAMPLE_PDF = EXAMPLE_DIR / "plan.pdf"
 GROUND_TRUTH_PATH = EXAMPLE_DIR / "ground_truth.json"
 
 ARCHITECTURE = [
-    ("Curved contours", "Stroke → skeleton → polylines", "contours"),
-    ("Spot elevations / symbols", "Heuristic near OCR/text", "symbols"),
-    ("Elevation callouts", "PDF text + optional EasyOCR", "elevations"),
-    ("Existing vs proposed", "Heuristic surface blend", "existing_vs_proposed"),
-    ("Legend / notes", "Stub in MVP", "legend"),
-    ("Elevation↔geometry link", "Nearest polyline", "association"),
+    ("Sheet segments", "Drawing / legend / title rails", "segments"),
+    ("Scale", "Parse 1\" = N' from sheet", "scale"),
+    ("Curved contours", "Skeleton polylines in drawing", "contours"),
+    ("Elevation callouts", "PDF text (+ optional OCR)", "elevations"),
+    ("Legend symbols", "Parse MAP LEGEND names", "legend"),
+    ("Elevation↔geometry", "Nearest polyline", "association"),
     ("Cut/fill volumes", "Deterministic grid", "cut_fill"),
 ]
 
 
 def load_ground_truth() -> dict:
     return json.loads(GROUND_TRUTH_PATH.read_text())
-
-
-def bgr_to_rgb(img: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 def main() -> None:
@@ -49,8 +43,8 @@ def main() -> None:
     )
     st.title("CV-Cut-Fill")
     st.caption(
-        "Detect + highlight plan entities → deterministic cut/fill. "
-        "Example mode scores against the Zirl Palmer volume report."
+        "Segment the sheet, detect scale + legend, highlight entities, "
+        "then compute deterministic cut/fill."
     )
 
     mode = st.radio(
@@ -61,40 +55,38 @@ def main() -> None:
     example_mode = mode.startswith("Example")
 
     with st.sidebar:
-        st.header("Layers")
-        show_contours = st.checkbox("Curved contours", value=True)
-        show_elevations = st.checkbox("Elevation callouts", value=True)
-        show_symbols = st.checkbox("Spot markers", value=True)
-        show_assoc = st.checkbox("Associations", value=True)
-        st.divider()
+        st.header("Run settings")
         dpi = st.slider("Raster DPI", 100, 200, 140, 10)
-        scale = st.number_input(
-            "Drawing scale (ft per inch)",
-            min_value=1.0,
-            max_value=100.0,
-            value=20.0,
-            step=1.0,
-            help="C-201 graphic scale is typically 1\" = 20'. Adjust if needed.",
-        )
         use_ocr = st.checkbox(
             "Fallback EasyOCR if few PDF elevations",
             value=False,
             help="Slower; enable if vector text extraction finds little.",
         )
         tolerance = st.slider("Score tolerance (%)", 1, 50, 5)
+        st.caption("Scale is auto-detected from the sheet (override only if needed).")
+        override_scale = st.checkbox("Override detected scale", value=False)
+        scale_override = None
+        if override_scale:
+            scale_override = st.number_input(
+                "ft per inch",
+                min_value=1.0,
+                max_value=200.0,
+                value=10.0,
+                step=1.0,
+            )
         run = st.button("Run detection", type="primary", use_container_width=True)
 
     pdf_path: Path | None = None
     ground_truth = None
 
     if example_mode:
+        gt = load_ground_truth()
         st.info(
             f"Static example: **Grading Plan C-201** · truth **cut "
-            f"{load_ground_truth()['cut_cy']} / fill {load_ground_truth()['fill_cy']} CY** "
-            "(Subgrade vs. Stripped)."
+            f"{gt['cut_cy']} / fill {gt['fill_cy']} CY** (Subgrade vs. Stripped)."
         )
         pdf_path = EXAMPLE_PDF
-        ground_truth = load_ground_truth()
+        ground_truth = gt
         if not pdf_path.exists():
             st.error(f"Missing example PDF at {pdf_path}")
             return
@@ -107,30 +99,23 @@ def main() -> None:
             pdf_path = upload_dir / uploaded.name
             pdf_path.write_bytes(uploaded.getbuffer())
 
-    layers = {
-        "contours": show_contours,
-        "elevations": show_elevations,
-        "symbols": show_symbols,
-        "associations": show_assoc,
-    }
-
     if run and pdf_path is not None:
-        with st.spinner("Rasterizing, detecting contours & elevations…"):
+        with st.spinner("Segmenting sheet, detecting scale/legend/contours…"):
             try:
                 result = run_pipeline(
                     pdf_path,
                     dpi=dpi,
-                    scale_ft_per_inch=float(scale),
+                    scale_ft_per_inch=float(scale_override)
+                    if scale_override is not None
+                    else None,
                     ground_truth=ground_truth,
                     use_ocr=use_ocr,
-                    overlay_layers=layers,
                 )
             except Exception as exc:  # noqa: BLE001
                 st.exception(exc)
                 return
         st.session_state["result"] = result
         st.session_state["example_mode"] = example_mode
-        st.session_state["tolerance"] = tolerance
 
     result = st.session_state.get("result")
     if result is None:
@@ -138,32 +123,83 @@ def main() -> None:
         _architecture_footer({})
         return
 
-    # Re-compose overlay if layers changed after run
-    result.overlay_bgr = compose_overlay(
-        result.page.image_bgr,
-        polylines=result.polylines,
-        elevations=result.elevations,
-        associations=result.associations,
-        layers=layers,
-    )
-    if example_mode and ground_truth is not None:
-        result.evaluation = evaluate(
-            result.volumes, ground_truth, tolerance_pct=float(tolerance)
+    # ---- Processed outputs: scale + legend ----
+    meta_l, meta_r = st.columns([1, 1.2])
+    with meta_l:
+        st.subheader("Detected scale")
+        st.metric("ft / inch", f"{result.scale.ft_per_inch:g}")
+        st.write(
+            {
+                "raw_text": result.scale.raw_text,
+                "source": result.scale.source,
+                "confidence": result.scale.confidence,
+                "used_for_volumes": result.surfaces.method_note,
+            }
+        )
+        st.caption(result.segments.notes)
+    with meta_r:
+        st.subheader("Map legend symbols")
+        if result.legend:
+            st.dataframe(
+                [
+                    {"name": e.name, "symbol": e.symbol_hint, "source": e.source}
+                    for e in result.legend
+                ],
+                use_container_width=True,
+                hide_index=True,
+                height=220,
+            )
+        else:
+            st.write("No legend entries parsed.")
+
+    # ---- Interactive map + live layer toggles ----
+    st.subheader("Interactive plan")
+    map_col, layer_col = st.columns([3.2, 1], gap="medium")
+    with layer_col:
+        st.markdown("**Layers**")
+        st.caption("Toggle while viewing — no re-run needed.")
+        show_contours = st.checkbox("Curved contours", value=True, key="ly_contours")
+        show_elevations = st.checkbox("Elevations", value=True, key="ly_elev")
+        show_symbols = st.checkbox("Spot markers", value=True, key="ly_sym")
+        show_assoc = st.checkbox("Associations", value=True, key="ly_assoc")
+        show_segments = st.checkbox("Sheet segments", value=True, key="ly_seg")
+        focus_drawing = st.checkbox("Focus drawing viewport", value=True, key="ly_focus")
+        st.divider()
+        st.write(
+            {
+                "contours": len(result.polylines),
+                "elevations": len(result.elevations),
+                "associations": len(result.associations),
+            }
         )
 
-    left, right = st.columns([2.4, 1], gap="large")
-    with left:
-        st.subheader("Detections")
-        st.image(bgr_to_rgb(result.overlay_bgr), use_container_width=True)
-        with st.expander("Color legend"):
-            st.markdown(
-                "- **Cyan** — curved contour polylines\n"
-                "- **Green** — elevation callouts\n"
-                "- **Orange** — spot markers near elevations\n"
-                "- **Magenta** — elevation → contour links"
-            )
+    layers = {
+        "contours": show_contours,
+        "elevations": show_elevations,
+        "symbols": show_symbols,
+        "associations": show_assoc,
+        "segments": show_segments,
+    }
 
-    with right:
+    with map_col:
+        fig = build_interactive_figure(
+            result.page.image_bgr,
+            polylines=result.polylines,
+            elevations=result.elevations,
+            associations=result.associations,
+            segments=result.segments,
+            layers=layers,
+            focus_drawing=focus_drawing,
+        )
+        st.plotly_chart(fig, use_container_width=True, config={
+            "scrollZoom": True,
+            "displaylogo": False,
+            "modeBarButtonsToAdd": ["drawopenpath", "eraseshape"],
+        })
+
+    # ---- Volumes / score ----
+    vcol, scol = st.columns(2)
+    with vcol:
         st.subheader("Volumes")
         v = result.volumes
         c1, c2, c3 = st.columns(3)
@@ -171,26 +207,17 @@ def main() -> None:
         c2.metric("Fill (CY)", f"{v.fill_cy:,.0f}")
         c3.metric("Net fill−cut", f"{v.net_cy:,.0f}")
         st.caption(v.message)
-        st.caption(result.surfaces.method_note)
-
-        st.subheader("Detections")
-        st.write(
-            {
-                "contour_polylines": len(result.polylines),
-                "elevations": len(result.elevations),
-                "associations": len(result.associations),
-                "surface_points": result.surfaces.point_count,
-            }
-        )
-
         if result.warnings:
             for w in result.warnings:
                 st.warning(w)
 
-        if example_mode and result.evaluation is not None:
-            ev = result.evaluation
+    with scol:
+        if example_mode and ground_truth is not None:
+            ev = evaluate(
+                result.volumes, ground_truth, tolerance_pct=float(tolerance)
+            )
             st.subheader("Score vs ground truth")
-            badge = "✅ Within tolerance" if ev.within_tolerance else "❌ Outside tolerance"
+            badge = "Within tolerance" if ev.within_tolerance else "Outside tolerance"
             st.markdown(f"**{badge}** (≤ {ev.tolerance_pct:g}%)")
             st.table(
                 {
@@ -217,24 +244,8 @@ def main() -> None:
                     ],
                 }
             )
-            st.caption(
-                "Truth from AGTEK-style Total Regions on Subgrade vs. Stripped. "
-                "Day-one CV on one sheet is not expected to match closely."
-            )
         elif not example_mode:
             st.info("Evaluation only available on the example plan.")
-
-        with st.expander("Elevation callouts"):
-            rows = [
-                {
-                    "value_ft": e.value_ft,
-                    "source": e.source,
-                    "text": e.text,
-                    "conf": round(e.confidence, 2),
-                }
-                for e in result.elevations[:100]
-            ]
-            st.dataframe(rows, use_container_width=True)
 
     _architecture_footer(result.stage_status)
 
