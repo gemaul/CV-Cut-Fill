@@ -6,9 +6,13 @@
   "fill_cy": 1319,
   "net_export_import_cy": -367,
   "source_file": "volume_report.xlsx",
-  "plan_file": "plan.pdf",
-  "plan_sheet": "C-201 Grading Plan",
-  "notes": "Headline totals from Excel Total Regions (earthwork + rock auger refusal).",
+  "plan_files": {
+    "grading": "grading_plan.pdf",
+    "existing": "existing_conditions.pdf",
+    "primary_for_volumes": "grading"
+  },
+  "plan_sheet": "C-201 Grading Plan (+ V-101 Existing Conditions companion)",
+  "notes": "Headline totals from Excel Total Regions. Grading plan (C-201) carries existing/proposed contours, spot elevations, and building pad. Existing-conditions sheet (V-101) provides site/demo context; volumes are scored from the grading sheet until surfaces are fused.",
   "regions": {
     "BUILDING": {"cut_cy": 0, "fill_cy": 713},
     "CONC PAVE": {"cut_cy": 14, "fill_cy": 0},

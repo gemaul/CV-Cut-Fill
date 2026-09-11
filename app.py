@@ -11,11 +11,14 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from src.pipeline import run_pipeline
+from src.pipeline import PipelineResult, run_pipeline
 from src.stages.evaluate import evaluate
 from src.viewer import build_interactive_figure
 
 EXAMPLE_DIR = ROOT / "samples" / "example"
+GRADING_PDF = EXAMPLE_DIR / "grading_plan.pdf"
+EXISTING_PDF = EXAMPLE_DIR / "existing_conditions.pdf"
+# Alias kept for compatibility
 EXAMPLE_PDF = EXAMPLE_DIR / "plan.pdf"
 GROUND_TRUTH_PATH = EXAMPLE_DIR / "ground_truth.json"
 
@@ -43,7 +46,7 @@ def main() -> None:
     )
     st.title("CV-Cut-Fill")
     st.caption(
-        "Segment the sheet, detect scale + legend, highlight entities, "
+        "Segment sheets, detect scale + legend, highlight entities, "
         "then compute deterministic cut/fill."
     )
 
@@ -63,7 +66,7 @@ def main() -> None:
             help="Slower; enable if vector text extraction finds little.",
         )
         tolerance = st.slider("Score tolerance (%)", 1, 50, 5)
-        st.caption("Scale is auto-detected from the sheet (override only if needed).")
+        st.caption("Scale is auto-detected from each sheet (override only if needed).")
         override_scale = st.checkbox("Override detected scale", value=False)
         scale_override = None
         if override_scale:
@@ -76,19 +79,21 @@ def main() -> None:
             )
         run = st.button("Run detection", type="primary", use_container_width=True)
 
-    pdf_path: Path | None = None
     ground_truth = None
+    upload_path: Path | None = None
 
     if example_mode:
         gt = load_ground_truth()
-        st.info(
-            f"Static example: **Grading Plan C-201** · truth **cut "
-            f"{gt['cut_cy']} / fill {gt['fill_cy']} CY** (Subgrade vs. Stripped)."
-        )
-        pdf_path = EXAMPLE_PDF
         ground_truth = gt
-        if not pdf_path.exists():
-            st.error(f"Missing example PDF at {pdf_path}")
+        st.info(
+            "**Example uses two sheets:** "
+            "**C-201 Grading Plan** (contours, spot elevations, proposed grades, building) "
+            "+ **V-101 Existing Conditions** (existing site / demolition context). "
+            f"Volumes scored vs truth **cut {gt['cut_cy']} / fill {gt['fill_cy']} CY** "
+            "from the grading sheet until surfaces are fused."
+        )
+        if not GRADING_PDF.exists() or not EXISTING_PDF.exists():
+            st.error("Missing example PDFs under samples/example/.")
             return
     else:
         st.warning("Try Your Own — detection + volumes only. No ground-truth scoring.")
@@ -96,61 +101,115 @@ def main() -> None:
         if uploaded is not None:
             upload_dir = ROOT / "samples" / "uploads"
             upload_dir.mkdir(parents=True, exist_ok=True)
-            pdf_path = upload_dir / uploaded.name
-            pdf_path.write_bytes(uploaded.getbuffer())
+            upload_path = upload_dir / uploaded.name
+            upload_path.write_bytes(uploaded.getbuffer())
 
-    if run and pdf_path is not None:
-        with st.spinner("Segmenting sheet, detecting scale/legend/contours…"):
-            try:
-                result = run_pipeline(
-                    pdf_path,
-                    dpi=dpi,
-                    scale_ft_per_inch=float(scale_override)
-                    if scale_override is not None
-                    else None,
-                    ground_truth=ground_truth,
-                    use_ocr=use_ocr,
-                )
-            except Exception as exc:  # noqa: BLE001
-                st.exception(exc)
-                return
-        st.session_state["result"] = result
-        st.session_state["example_mode"] = example_mode
+    if run:
+        scale_kw = (
+            float(scale_override) if scale_override is not None else None
+        )
+        if example_mode:
+            with st.spinner("Running C-201 grading + V-101 existing-conditions…"):
+                try:
+                    grading = run_pipeline(
+                        GRADING_PDF if GRADING_PDF.exists() else EXAMPLE_PDF,
+                        dpi=dpi,
+                        scale_ft_per_inch=scale_kw,
+                        ground_truth=ground_truth,
+                        use_ocr=use_ocr,
+                    )
+                    existing = run_pipeline(
+                        EXISTING_PDF,
+                        dpi=dpi,
+                        scale_ft_per_inch=scale_kw,
+                        ground_truth=None,
+                        use_ocr=use_ocr,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    st.exception(exc)
+                    return
+            st.session_state["result_grading"] = grading
+            st.session_state["result_existing"] = existing
+            st.session_state["result"] = grading  # volumes/score source
+            st.session_state["example_mode"] = True
+        elif upload_path is not None:
+            with st.spinner("Segmenting sheet, detecting scale/legend/contours…"):
+                try:
+                    result = run_pipeline(
+                        upload_path,
+                        dpi=dpi,
+                        scale_ft_per_inch=scale_kw,
+                        ground_truth=None,
+                        use_ocr=use_ocr,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    st.exception(exc)
+                    return
+            st.session_state["result"] = result
+            st.session_state["result_grading"] = None
+            st.session_state["result_existing"] = None
+            st.session_state["example_mode"] = False
 
-    result = st.session_state.get("result")
+    result: PipelineResult | None = st.session_state.get("result")
     if result is None:
         st.write("Choose a mode and click **Run detection**.")
         _architecture_footer({})
         return
 
+    example_mode = bool(st.session_state.get("example_mode", example_mode))
+    grading_result: PipelineResult | None = st.session_state.get("result_grading")
+    existing_result: PipelineResult | None = st.session_state.get("result_existing")
+
+    # ---- Sheet picker for example dual-PDF ----
+    active = result
+    if example_mode and grading_result is not None and existing_result is not None:
+        sheet = st.radio(
+            "Active sheet",
+            [
+                "C-201 Grading Plan (volumes)",
+                "V-101 Existing Conditions (context)",
+            ],
+            horizontal=True,
+            key="active_sheet",
+        )
+        active = (
+            grading_result
+            if sheet.startswith("C-201")
+            else existing_result
+        )
+        st.caption(
+            "Cut/fill scoring always uses **C-201**. V-101 is shown for existing-site "
+            "context (building/demo). Next step is fusing existing + proposed surfaces."
+        )
+
     # ---- Processed outputs: scale + legend ----
     meta_l, meta_r = st.columns([1, 1.2])
     with meta_l:
         st.subheader("Detected scale")
-        st.metric("ft / inch", f"{result.scale.ft_per_inch:g}")
+        st.metric("ft / inch", f"{active.scale.ft_per_inch:g}")
         st.write(
             {
-                "raw_text": result.scale.raw_text,
-                "source": result.scale.source,
-                "confidence": result.scale.confidence,
+                "raw_text": active.scale.raw_text,
+                "source": active.scale.source,
+                "confidence": active.scale.confidence,
                 "used_for_volumes": result.surfaces.method_note,
             }
         )
-        st.caption(result.segments.notes)
+        st.caption(active.segments.notes)
     with meta_r:
         st.subheader("Map legend symbols")
-        if result.legend:
-            # Show symbol crop + name for each legend entry
-            for e in result.legend:
-                c_icon, c_text = st.columns([0.22, 0.78], gap="small")
-                with c_icon:
-                    if e.icon_rgb is not None:
-                        st.image(e.icon_rgb, width=72)
-                    else:
-                        st.caption("—")
-                with c_text:
-                    st.markdown(f"**{e.name}**")
-                    st.caption(e.symbol_hint)
+        if active.legend:
+            with st.container(height=280):
+                for e in active.legend:
+                    c_icon, c_text = st.columns([0.22, 0.78], gap="small")
+                    with c_icon:
+                        if e.icon_rgb is not None:
+                            st.image(e.icon_rgb, width=72)
+                        else:
+                            st.caption("—")
+                    with c_text:
+                        st.markdown(f"**{e.name}**")
+                        st.caption(e.symbol_hint)
         else:
             st.write("No legend entries parsed.")
 
@@ -169,9 +228,9 @@ def main() -> None:
         st.divider()
         st.write(
             {
-                "contours": len(result.polylines),
-                "elevations": len(result.elevations),
-                "associations": len(result.associations),
+                "contours": len(active.polylines),
+                "elevations": len(active.elevations),
+                "associations": len(active.associations),
             }
         )
 
@@ -185,11 +244,11 @@ def main() -> None:
 
     with map_col:
         fig = build_interactive_figure(
-            result.page.image_bgr,
-            polylines=result.polylines,
-            elevations=result.elevations,
-            associations=result.associations,
-            segments=result.segments,
+            active.page.image_bgr,
+            polylines=active.polylines,
+            elevations=active.elevations,
+            associations=active.associations,
+            segments=active.segments,
             layers=layers,
             focus_drawing=focus_drawing,
         )
@@ -208,7 +267,7 @@ def main() -> None:
             },
         )
 
-    # ---- Volumes / score ----
+    # ---- Volumes / score (always from grading / primary result) ----
     vcol, scol = st.columns(2)
     with vcol:
         st.subheader("Volumes")
@@ -218,6 +277,8 @@ def main() -> None:
         c2.metric("Fill (CY)", f"{v.fill_cy:,.0f}")
         c3.metric("Net fill−cut", f"{v.net_cy:,.0f}")
         st.caption(v.message)
+        if example_mode:
+            st.caption("Scored from **C-201 Grading Plan** detections.")
         if result.warnings:
             for w in result.warnings:
                 st.warning(w)
@@ -258,7 +319,7 @@ def main() -> None:
         elif not example_mode:
             st.info("Evaluation only available on the example plan.")
 
-    _architecture_footer(result.stage_status)
+    _architecture_footer(active.stage_status)
 
 
 def _architecture_footer(status: dict) -> None:

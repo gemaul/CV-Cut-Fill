@@ -6,11 +6,12 @@ Detect and highlight entities on a civil **grading plan**, then compute **determ
 
 | Asset | Role |
 | --- | --- |
-| [`samples/example/plan.pdf`](samples/example/plan.pdf) | Zirl Palmer Prep Academy — **Grading Plan C-201** |
+| [`samples/example/grading_plan.pdf`](samples/example/grading_plan.pdf) | **C-201** Grading Plan — contours, spot elevations, proposed grades, building |
+| [`samples/example/existing_conditions.pdf`](samples/example/existing_conditions.pdf) | **V-101** Existing Conditions & Demolition — existing site context |
 | [`samples/example/ground_truth.json`](samples/example/ground_truth.json) | **Cut 952 CY / Fill 1319 CY** (Total Regions, Subgrade vs. Stripped) |
 | [`samples/example/volume_report.xlsx`](samples/example/volume_report.xlsx) | Provenance volume report |
 
-Optional sheets for Try Your Own are under `samples/optional/`.
+Example mode runs **both** sheets. Volumes are scored from **C-201** until existing + proposed surfaces are fused.
 
 ## Modes
 
