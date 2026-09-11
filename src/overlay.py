@@ -7,13 +7,16 @@ from .stages.associate import Association
 from .stages.contours_curved import Polyline
 from .stages.elevations_ocr import ElevationCallout
 from .stages.segment import SheetSegments
+from .stages.site_structure import SiteStructure
 
 CYAN = (255, 220, 0)
 GREEN = (60, 200, 60)
 ORANGE = (0, 140, 255)
 MAGENTA = (255, 0, 255)
-EXISTING = (180, 180, 255)  # light warm for dashed existing
-PROPOSED = (255, 200, 0)  # cyan-ish proposed
+EXISTING = (180, 180, 255)
+PROPOSED = (255, 200, 0)
+PROPERTY = (0, 0, 220)
+BUILDING = (0, 140, 255)
 
 
 def compose_overlay(
@@ -23,6 +26,7 @@ def compose_overlay(
     elevations: list[ElevationCallout],
     associations: list[Association],
     segments: SheetSegments | None = None,
+    site: SiteStructure | None = None,
     layers: dict[str, bool] | None = None,
 ) -> np.ndarray:
     layers = {
@@ -31,6 +35,8 @@ def compose_overlay(
         "symbols": True,
         "associations": True,
         "segments": True,
+        "property": True,
+        "building": True,
         **(layers or {}),
     }
     out = image_bgr.copy()
@@ -38,6 +44,12 @@ def compose_overlay(
 
     if layers.get("segments", True) and segments is not None:
         for region in segments.regions:
+            if region.role in ("site", "topo_zone"):
+                # Drawn via property/building/zone-specific styling below / as light boxes
+                if region.role == "topo_zone" and layers.get("segments", True):
+                    x0, y0, x1, y1 = region.bbox
+                    cv2.rectangle(out, (x0, y0), (x1, y1), _hex_to_bgr(region.color), 1)
+                continue
             x0, y0, x1, y1 = region.bbox
             color = _hex_to_bgr(region.color)
             thickness = 3 if region.role == "drawing" else 2
@@ -53,11 +65,32 @@ def compose_overlay(
                 cv2.LINE_AA,
             )
 
+    if layers.get("property", True) and site is not None:
+        prop_strokes = [p for p in (site.property_lines or []) if len(p.points) >= 2]
+        if prop_strokes:
+            for poly in prop_strokes:
+                pts = poly.points.astype(np.int32).reshape(-1, 1, 2)
+                cv2.polylines(
+                    out, [pts], isClosed=False, color=PROPERTY, thickness=3, lineType=cv2.LINE_AA
+                )
+
+    if layers.get("building", True) and site is not None:
+        bld_strokes = [p for p in (site.building_lines or []) if len(p.points) >= 2]
+        if bld_strokes:
+            for poly in bld_strokes:
+                pts = poly.points.astype(np.int32).reshape(-1, 1, 2)
+                cv2.polylines(
+                    out, [pts], isClosed=False, color=BUILDING, thickness=3, lineType=cv2.LINE_AA
+                )
+
     if layers.get("contours", True):
         for poly in polylines:
-            if poly.kind == "structure":
-                continue
-            color = EXISTING if poly.kind == "existing" else PROPOSED
+            if poly.kind in ("structure", "property", "building"):
+                color = PROPERTY if poly.kind == "property" else BUILDING
+                if poly.kind == "structure":
+                    continue
+            else:
+                color = EXISTING if poly.kind == "existing" else PROPOSED
             pts = poly.points.astype(np.int32).reshape(-1, 1, 2)
             cv2.polylines(
                 out, [pts], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA

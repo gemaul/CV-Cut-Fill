@@ -9,6 +9,7 @@ venv/
 samples/uploads/
 *.png
 !docs/**/*.png
+!samples/styles/**/*.png
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

@@ -1,0 +1,21 @@
+# CV-Cut-Fill — Fly.io
+# Deploy: fly launch (first time) or fly deploy
+# Custom domain: fly certs add your.domain.com
+
+app = "cv-cut-fill"
+primary_region = "sjc"
+
+[build]
+
+[http_service]
+  internal_port = 8501
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[vm]]
+  memory = "2gb"
+  cpu_kind = "shared"
+  cpus = 2

@@ -25,21 +25,37 @@ def extract_curved_contours(
     min_length_px: float = 55.0,
     max_polylines: int = 500,
     work_max_dim: int = 1800,
+    allow_mask: np.ndarray | None = None,
+    drop_structure: bool = True,
 ) -> list[Polyline]:
     """Extract topographic contours via ridge detection (Sato) + skeleton tracing.
 
     Adaptive threshold alone misses faint mid-gray contour ink. Sato black-ridge
     filtering targets thin dark strokes, then dash gaps are closed before tracing.
+
+    ``allow_mask`` (H×W bool/uint8, same size as ``image_bgr``) restricts ink to
+    property-interior zones after building/property structure has been removed.
     """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     scale = 1.0
+    mask_work = None
+    if allow_mask is not None:
+        if allow_mask.shape[:2] != (h, w):
+            raise ValueError("allow_mask must match image_bgr spatial size")
+        mask_work = (allow_mask.astype(np.uint8) > 0).astype(np.uint8) * 255
     if max(h, w) > work_max_dim:
         scale = work_max_dim / max(h, w)
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        if mask_work is not None:
+            mask_work = cv2.resize(
+                mask_work, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST
+            )
     wh, ww = gray.shape
 
     ink = _ridge_ink_mask(gray)
+    if mask_work is not None:
+        ink = cv2.bitwise_and(ink, mask_work)
 
     # Bridge dashed existing contours
     ink = cv2.morphologyEx(
@@ -71,9 +87,13 @@ def extract_curved_contours(
     kept: list[Polyline] = []
     for poly in polylines:
         _annotate_geometry(poly)
-        if _classify_polyline(poly) == "structure":
+        cls = _classify_polyline(poly)
+        if drop_structure and cls == "structure":
             continue
-        poly.kind = _classify_existing_proposed(poly, image_bgr)
+        if cls == "structure":
+            poly.kind = "structure"
+        else:
+            poly.kind = _classify_existing_proposed(poly, image_bgr)
         kept.append(poly)
 
     # Prefer longer + curvier strokes (site contours over tiny nicks)

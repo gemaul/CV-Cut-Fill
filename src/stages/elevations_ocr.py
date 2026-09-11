@@ -37,8 +37,25 @@ def extract_elevations(
     min_elev: float = 800.0,
     max_elev: float = 1200.0,
     drawing_bbox: tuple[int, int, int, int] | None = None,
+    exclude_bboxes: list[tuple[int, int, int, int]] | None = None,
+    sheet_role: str = "auto",
 ) -> list[ElevationCallout]:
+    """Extract elevation callouts.
+
+    ``sheet_role``:
+      - ``proposed``: strict decimals (finished-grade spots); bare ints need context
+      - ``existing``: bare contour labels (####) allowed as existing elevations
+      - ``auto``: same as proposed
+    """
+    allow_bare_int = sheet_role == "existing"
     callouts: list[ElevationCallout] = []
+
+    def _excluded(cx: float, cy: float) -> bool:
+        if exclude_bboxes:
+            for bx0, by0, bx1, by1 in exclude_bboxes:
+                if bx0 <= cx <= bx1 and by0 <= cy <= by1:
+                    return True
+        return False
 
     for span in page.text_spans:
         x0, y0, x1, y1 = span["bbox_px"]
@@ -47,6 +64,8 @@ def extract_elevations(
             dx0, dy0, dx1, dy1 = drawing_bbox
             if not (dx0 <= cx <= dx1 and dy0 <= cy <= dy1):
                 continue
+        if _excluded(cx, cy):
+            continue
 
         ctx = _nearby_context(page, cx, cy, radius=70)
         parsed = _parse_elevation(
@@ -54,11 +73,16 @@ def extract_elevations(
             context=ctx,
             min_elev=min_elev,
             max_elev=max_elev,
-            allow_bare_int=False,
+            allow_bare_int=allow_bare_int,
+            sheet_role=sheet_role,
         )
         if parsed is None:
             continue
         value, kind, conf = parsed
+        # Legend example "800" / demo numbers — reject far from site grade cluster later;
+        # on proposed sheets, never keep bare weak ints without TC/EL/ME context.
+        if sheet_role != "existing" and kind == "weak":
+            continue
         callouts.append(
             ElevationCallout(
                 text=span["text"],
@@ -79,12 +103,26 @@ def extract_elevations(
                 min_elev=min_elev,
                 max_elev=max_elev,
                 drawing_bbox=drawing_bbox,
+                sheet_role=sheet_role,
             )
         )
 
     callouts = _dedupe(callouts)
-    callouts = _dedupe_ffe(callouts)
+    if sheet_role != "existing":
+        callouts = _dedupe_ffe(callouts)
+    callouts = _reject_elevation_outliers(callouts)
     return callouts
+
+
+def _reject_elevation_outliers(
+    callouts: list[ElevationCallout], *, max_delta_ft: float = 25.0
+) -> list[ElevationCallout]:
+    """Drop legend demo values (e.g. 800) far from the site grade cluster."""
+    if len(callouts) < 5:
+        return callouts
+    vals = np.array([c.value_ft for c in callouts], dtype=np.float64)
+    med = float(np.median(vals))
+    return [c for c in callouts if abs(c.value_ft - med) <= max_delta_ft]
 
 
 def _nearby_context(page: RasterPage, x: float, y: float, radius: float) -> str:
@@ -104,6 +142,7 @@ def _parse_elevation(
     min_elev: float,
     max_elev: float,
     allow_bare_int: bool,
+    sheet_role: str = "auto",
 ) -> tuple[float, str, float] | None:
     cleaned = text.strip().replace(",", "")
     ctx_ok = bool(_CONTEXT_OK.search(context) or _CONTEXT_OK.search(cleaned))
@@ -113,16 +152,21 @@ def _parse_elevation(
         val = float(m.group(1))
         if not (min_elev <= val <= max_elev):
             return None
-        kind = "existing_match" if re.search(r"\bME\b", context, re.I) else "spot"
+        if sheet_role == "existing":
+            kind = "existing_match"
+        else:
+            kind = "existing_match" if re.search(r"\bME\b", context, re.I) else "spot"
         conf = 0.95 if ctx_ok else 0.8
         return val, kind, conf
 
     m = _INT_ELEV.match(cleaned)
-    if m and (allow_bare_int or ctx_ok):
+    if m:
         val = float(m.group(1))
         if not (min_elev <= val <= max_elev):
             return None
-        # Bare integers without elevation context are usually IDs / stations
+        # Existing-conditions sheets label contours with bare integers (1010, 1015…)
+        if allow_bare_int or sheet_role == "existing":
+            return val, "existing_match", 0.7 if ctx_ok else 0.6
         if not ctx_ok:
             return None
         return val, "weak", 0.55
@@ -173,6 +217,7 @@ def _ocr_elevations(
     min_elev: float,
     max_elev: float,
     drawing_bbox: tuple[int, int, int, int] | None,
+    sheet_role: str = "auto",
 ) -> list[ElevationCallout]:
     try:
         import easyocr
@@ -203,7 +248,8 @@ def _ocr_elevations(
             context=text,
             min_elev=min_elev,
             max_elev=max_elev,
-            allow_bare_int=False,
+            allow_bare_int=sheet_role == "existing",
+            sheet_role=sheet_role,
         )
         if parsed is None:
             continue
