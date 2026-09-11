@@ -27,49 +27,20 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Production (own domain)
+## Deploy (Streamlit Community Cloud)
 
-Streamlit Community Cloud cannot attach a custom domain. This repo ships with
-**Docker + Fly.io** so you can serve the app at e.g. `https://cutfill.yourdomain.com`.
+Easiest host — free `*.streamlit.app` URL, no custom domain needed.
 
-### 1. Push to GitHub
+1. Push `main` to GitHub (already set up for `gemaul/CV-Cut-Fill`).
+2. Open [share.streamlit.io](https://share.streamlit.io/) → **New app**.
+3. Repo: `gemaul/CV-Cut-Fill`, branch: `main`, main file: `app.py`.
+4. Deploy. Live URL looks like `https://cv-cut-fill.streamlit.app`.
 
-```bash
-git push -u origin main
-```
+`packages.txt` installs OpenCV system libs on the Cloud VM.
 
-### 2. Deploy to Fly.io
+### Optional: own domain (Fly.io / Docker)
 
-```bash
-# Install: https://fly.io/docs/hands-on/install-flyctl/
-fly auth login
-fly launch --no-deploy   # first time only if app name is free
-fly deploy
-```
-
-App URL (temporary): `https://cv-cut-fill.fly.dev`
-
-### 3. Attach your domain
-
-```bash
-fly certs add cutfill.yourdomain.com
-```
-
-Then at your DNS provider create the record Fly prints (usually a **CNAME** to
-`cv-cut-fill.fly.dev`, or A/AAAA for apex domains). Wait for TLS:
-
-```bash
-fly certs show cutfill.yourdomain.com
-```
-
-### Docker only (any VPS)
-
-```bash
-docker build -t cv-cut-fill .
-docker run -p 8501:8501 cv-cut-fill
-```
-
-Put nginx/Caddy in front with TLS for your domain.
+See `Dockerfile` + `fly.toml` if you later want a custom hostname.
 
 ## License / data
 
